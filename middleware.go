@@ -151,7 +151,8 @@ func AuthMiddleware(validTokens map[string]bool) Middleware {
 			}
 
 			// 认证成功，传递实际数据给下一个处理器
-			return next.Handle(ctx, command, commandType, actualData)
+			response, err := next.Handle(ctx, command, commandType, actualData)
+			return response, err
 		})
 	}
 }

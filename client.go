@@ -76,6 +76,7 @@ func (c *Client) sendRequestWithResponse(ctx context.Context, command byte, comm
 	if needResponse {
 		response = chead.HaveResponse
 	}
+	head.SetCommandType(commandType)
 
 	if err := head.SetConfig(chead.REQ, response, commandType); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
@@ -137,7 +138,7 @@ func (c *Client) readResponse(ctx context.Context) ([]byte, error) {
 	}
 
 	// 检查是否为错误响应
-	if head.GetCommand() == 255 && head.GetCommandType() == 31 {
+	if head.GetCommand() == 127 && head.GetCommandType() == 31 {
 		// 这是错误响应
 		contentLength := head.GetContentLength()
 		if contentLength > 0 {

@@ -340,7 +340,7 @@ func (s *Server) sendSuccessResponse(conn net.Conn, requestHead *chead.HEAD, dat
 // sendErrorResponse 发送错误响应
 func (s *Server) sendErrorResponse(conn net.Conn, requestHead *chead.HEAD, errMsg string) {
 	responseHead := chead.NewHead()
-	responseHead.SetCommand(255)
+	responseHead.SetCommand(127) // 使用最大有效命令值表示错误
 	responseHead.SetConfig(chead.REP, chead.NoResponse, 31)
 
 	errorData := []byte(errMsg)
