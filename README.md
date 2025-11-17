@@ -258,12 +258,6 @@ go test -v ./...
 - 限流功能
 - 超时处理
 
-## 示例应用
-
-查看 `example/` 目录中的完整示例：
-- `example/server/` - 服务器示例
-- `example/client/` - 客户端示例
-
 ## 许可证
 
 请参考项目根目录的 LICENSE 文件。
