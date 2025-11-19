@@ -17,7 +17,7 @@ type Client struct {
 	writeTimeout time.Duration
 }
 
-// NewClient 创建新的TCP客户端
+// New 创建新的TCP客户端
 func NewClient() *Client {
 	return &Client{
 		readTimeout:  30 * time.Second,
@@ -76,8 +76,6 @@ func (c *Client) sendRequestWithResponse(ctx context.Context, command byte, comm
 	if needResponse {
 		response = chead.HaveResponse
 	}
-	head.SetCommandType(commandType)
-
 	if err := head.SetConfig(chead.REQ, response, commandType); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}

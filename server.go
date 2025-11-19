@@ -56,8 +56,8 @@ type Server struct {
 	mu        sync.RWMutex
 }
 
-// NewServer 创建新的TCP服务器
-func NewServer(addr string) *Server {
+// New 创建新的TCP服务器
+func New(addr string) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{
 		addr:            addr,
