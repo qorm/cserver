@@ -128,35 +128,6 @@ func RateLimitMiddleware(requestsPerSecond int) Middleware {
 	}
 }
 
-// AuthMiddleware 简单的认证中间件示例
-func AuthMiddleware(validTokens map[string]bool) Middleware {
-	mu := sync.RWMutex{}
-
-	return func(next Handler) Handler {
-		return HandlerFunc(func(ctx context.Context, command byte, commandType uint8, data []byte) ([]byte, error) {
-			// 这里假设data的前16字节是token（简化示例）
-			if len(data) < 16 {
-				return nil, fmt.Errorf("authentication required: missing token")
-			}
-
-			token := string(data[:16])
-			actualData := data[16:]
-
-			mu.RLock()
-			valid := validTokens[token]
-			mu.RUnlock()
-
-			if !valid {
-				return nil, fmt.Errorf("authentication failed: invalid token")
-			}
-
-			// 认证成功，传递实际数据给下一个处理器
-			response, err := next.Handle(ctx, command, commandType, actualData)
-			return response, err
-		})
-	}
-}
-
 // MetricsMiddleware 统计中间件
 type MetricsCollector struct {
 	mu            sync.RWMutex
@@ -221,5 +192,79 @@ func ChainMiddleware(middlewares ...Middleware) Middleware {
 			next = middlewares[i](next)
 		}
 		return next
+	}
+}
+
+// GetAuthInfo 从上下文中获取认证信息
+func GetAuthInfo(ctx context.Context) (interface{}, bool) {
+	authInfo := ctx.Value(AuthInfoKey)
+	if authInfo == nil {
+		return nil, false
+	}
+	return authInfo, true
+}
+
+// GetRemoteAddr 从上下文中获取远程地址
+func GetRemoteAddr(ctx context.Context) (string, bool) {
+	addr := ctx.Value(RemoteAddrKey)
+	if addr == nil {
+		return "", false
+	}
+	if strAddr, ok := addr.(string); ok {
+		return strAddr, true
+	}
+	return "", false
+}
+
+// RequireAuthMiddleware 要求认证的中间件
+// 如果请求上下文中没有认证信息，则拒绝请求
+func RequireAuthMiddleware() Middleware {
+	return func(next Handler) Handler {
+		return HandlerFunc(func(ctx context.Context, command byte, commandType uint8, data []byte) ([]byte, error) {
+			_, authenticated := GetAuthInfo(ctx)
+			if !authenticated {
+				return nil, fmt.Errorf("authentication required")
+			}
+			return next.Handle(ctx, command, commandType, data)
+		})
+	}
+}
+
+// RequireRoleMiddleware 要求特定角色的中间件
+// authInfo 应该实现 HasRole(role string) bool 方法，或者可以自定义检查逻辑
+func RequireRoleMiddleware(roleCheck func(authInfo interface{}) bool) Middleware {
+	return func(next Handler) Handler {
+		return HandlerFunc(func(ctx context.Context, command byte, commandType uint8, data []byte) ([]byte, error) {
+			authInfo, authenticated := GetAuthInfo(ctx)
+			if !authenticated {
+				return nil, fmt.Errorf("authentication required")
+			}
+
+			if !roleCheck(authInfo) {
+				return nil, fmt.Errorf("insufficient permissions")
+			}
+
+			return next.Handle(ctx, command, commandType, data)
+		})
+	}
+}
+
+// ConnectionLoggingMiddleware 记录连接信息的中间件
+func ConnectionLoggingMiddleware(logger *log.Logger) Middleware {
+	return func(next Handler) Handler {
+		return HandlerFunc(func(ctx context.Context, command byte, commandType uint8, data []byte) ([]byte, error) {
+			remoteAddr, _ := GetRemoteAddr(ctx)
+			authInfo, authenticated := GetAuthInfo(ctx)
+
+			if authenticated {
+				logger.Printf("[CONN] RemoteAddr: %s, Authenticated: true, AuthInfo: %v, Command: %d, CommandType: %d",
+					remoteAddr, authInfo, command, commandType)
+			} else {
+				logger.Printf("[CONN] RemoteAddr: %s, Authenticated: false, Command: %d, CommandType: %d",
+					remoteAddr, command, commandType)
+			}
+
+			return next.Handle(ctx, command, commandType, data)
+		})
 	}
 }

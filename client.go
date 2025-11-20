@@ -12,16 +12,18 @@ import (
 
 // Client TCP客户端
 type Client struct {
-	conn         net.Conn
-	readTimeout  time.Duration
-	writeTimeout time.Duration
+	conn          net.Conn
+	readTimeout   time.Duration
+	writeTimeout  time.Duration
+	authenticated bool // 是否已认证
 }
 
-// New 创建新的TCP客户端
+// NewClient 创建新的TCP客户端
 func NewClient() *Client {
 	return &Client{
-		readTimeout:  30 * time.Second,
-		writeTimeout: 30 * time.Second,
+		readTimeout:   30 * time.Second,
+		writeTimeout:  30 * time.Second,
+		authenticated: false,
 	}
 }
 
@@ -44,9 +46,32 @@ func (c *Client) Connect(addr string) error {
 // Close 关闭连接
 func (c *Client) Close() error {
 	if c.conn != nil {
+		c.authenticated = false
 		return c.conn.Close()
 	}
 	return nil
+}
+
+// Authenticate 发送认证请求（使用命令 0,0）
+func (c *Client) Authenticate(ctx context.Context, authData []byte) error {
+	if c.conn == nil {
+		return fmt.Errorf("not connected")
+	}
+
+	// 使用 SendRequest 发送认证请求（command=0, commandType=0）
+	_, err := c.SendRequest(ctx, 0, 0, authData)
+	if err != nil {
+		c.authenticated = false
+		return fmt.Errorf("authentication failed: %w", err)
+	}
+
+	c.authenticated = true
+	return nil
+}
+
+// IsAuthenticated 检查是否已认证
+func (c *Client) IsAuthenticated() bool {
+	return c.authenticated
 }
 
 // SendRequest 发送请求
