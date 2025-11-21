@@ -7,160 +7,195 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/qorm/chead"
 )
 
-// Handler 处理器接口，用户可以实现这个接口来处理不同的命令
-type Handler interface {
-	Handle(ctx context.Context, command byte, commandType uint8, data []byte) ([]byte, error)
-}
+// HandlerFunc 处理函数类型
+type HandlerFunc func(ctx context.Context, command byte, commandType uint8, data []byte) ([]byte, error)
 
-// ConnectionAuthenticator 连接级认证器接口
-type ConnectionAuthenticator interface {
-	// Authenticate 对连接进行认证，返回认证信息和错误
-	// authData 是客户端发送的认证数据
-	// 返回的 interface{} 可以是任何认证信息（如用户ID、角色等），会存储在连接上下文中
-	Authenticate(authData []byte) (interface{}, error)
-}
+// Middleware 中间件类型
+type Middleware func(HandlerFunc) HandlerFunc
 
-// ConnectionAuthenticatorFunc 函数类型适配器
-type ConnectionAuthenticatorFunc func(authData []byte) (interface{}, error)
-
-func (f ConnectionAuthenticatorFunc) Authenticate(authData []byte) (interface{}, error) {
-	return f(authData)
-}
-
-// contextKey 用于在context中存储认证信息的键类型
-type contextKey string
+// contextKey 上下文键类型
+type contextKey int
 
 const (
-	// AuthInfoKey 认证信息在context中的键
-	AuthInfoKey contextKey = "auth_info"
-	// RemoteAddrKey 远程地址在context中的键
-	RemoteAddrKey contextKey = "remote_addr"
-	// AuthInfoSetterKey 认证信息设置器在context中的键
-	AuthInfoSetterKey contextKey = "auth_info_setter"
+	authInfoKey contextKey = iota
+	remoteAddrKey
+	authInfoSetterKey
 )
 
-// AuthInfoSetter 认证信息设置器，用于在认证处理器中设置认证信息
+// AuthInfoKey 认证信息上下文键（公开）
+const AuthInfoKey = authInfoKey
+
+// RemoteAddrKey 远程地址上下文键（公开）
+const RemoteAddrKey = remoteAddrKey
+
+// AuthInfoSetterKey 认证信息设置器上下文键（公开）
+const AuthInfoSetterKey = authInfoSetterKey
+
+// AuthInfoSetter 认证信息设置器
 type AuthInfoSetter struct {
+	mu       sync.RWMutex
 	authInfo interface{}
 	isSet    bool
-	mu       sync.Mutex
 }
 
 // Set 设置认证信息
-func (s *AuthInfoSetter) Set(authInfo interface{}) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.authInfo = authInfo
-	s.isSet = true
+func (a *AuthInfoSetter) Set(authInfo interface{}) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.authInfo = authInfo
+	a.isSet = true
 }
 
 // Get 获取认证信息
-func (s *AuthInfoSetter) Get() (interface{}, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.authInfo, s.isSet
+func (a *AuthInfoSetter) Get() (interface{}, bool) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.authInfo, a.isSet
 }
 
-// HandlerFunc 函数类型适配器，允许普通函数作为Handler
-type HandlerFunc func(ctx context.Context, command byte, commandType uint8, data []byte) ([]byte, error)
-
-func (f HandlerFunc) Handle(ctx context.Context, command byte, commandType uint8, data []byte) ([]byte, error) {
-	return f(ctx, command, commandType, data)
-}
-
-// Middleware 中间件类型
-type Middleware func(Handler) Handler
-
-// RouteKey 路由键，用于命令和命令类型的组合
+// RouteKey 路由键
 type RouteKey struct {
 	Command     byte
 	CommandType uint8
 }
 
-// Server TCP服务器结构
-type Server struct {
-	addr            string
-	listener        net.Listener
-	handlers        map[RouteKey]Handler // 路由键到处理器的映射
-	commandHandlers map[byte]Handler     // 仅基于命令的处理器映射（向后兼容）
-	middleware      []Middleware         // 中间件链
-	defaultHandler  Handler              // 默认处理器
-	logger          *log.Logger
+// route 路由信息（预编译的处理器+中间件链）
+type route struct {
+	handler     HandlerFunc
+	globalChain HandlerFunc // 预编译的全局中间件链
+	authChain   HandlerFunc // 预编译的全局+认证中间件链
+}
 
-	// 配置选项
+// Server TCP服务器
+type Server struct {
+	addr     string
+	listener net.Listener
+	routes   sync.Map // map[RouteKey]*route - 线程安全的路由表
+	logger   *log.Logger
+
+	// 中间件
+	mu             sync.RWMutex
+	middleware     []Middleware // 全局中间件
+	authMiddleware []Middleware // 认证中间件
+	defaultHandler HandlerFunc
+
+	// 配置
 	readTimeout    time.Duration
 	writeTimeout   time.Duration
 	maxConnections int
-
-	// 认证相关
-	requireAuth bool // 是否要求认证
+	requireAuth    bool
 
 	// 运行时状态
 	ctx       context.Context
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
-	connCount int32
-	mu        sync.RWMutex
+	connCount atomic.Int32
 }
 
 // New 创建新的TCP服务器
 func New(addr string) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{
-		addr:            addr,
-		handlers:        make(map[RouteKey]Handler),
-		commandHandlers: make(map[byte]Handler),
-		middleware:      make([]Middleware, 0),
-		readTimeout:     30 * time.Second,
-		writeTimeout:    30 * time.Second,
-		maxConnections:  1000,
-		requireAuth:     false,
-		ctx:             ctx,
-		cancel:          cancel,
-		logger:          log.New(log.Writer(), "[CSERVER] ", log.LstdFlags),
+		addr:           addr,
+		middleware:     make([]Middleware, 0),
+		authMiddleware: make([]Middleware, 0),
+		readTimeout:    30 * time.Second,
+		writeTimeout:   30 * time.Second,
+		maxConnections: 1000,
+		requireAuth:    false,
+		ctx:            ctx,
+		cancel:         cancel,
+		logger:         log.New(log.Writer(), "[CSERVER] ", log.LstdFlags),
 	}
 }
 
-// RegisterHandler 注册基于命令和命令类型的处理器
-func (s *Server) RegisterHandler(command byte, commandType uint8, handler Handler) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// Handle 注册处理器（支持可选的路由级中间件）
+func (s *Server) Handle(command byte, commandType uint8, handler HandlerFunc, middlewares ...Middleware) {
 	key := RouteKey{Command: command, CommandType: commandType}
-	s.handlers[key] = handler
+
+	// 应用路由级中间件（从右到左）
+	finalHandler := handler
+	for i := len(middlewares) - 1; i >= 0; i-- {
+		finalHandler = middlewares[i](finalHandler)
+	}
+
+	// 预编译中间件链
+	s.mu.RLock()
+	globalChain := s.buildChain(finalHandler, s.middleware)
+	authChain := s.buildChain(finalHandler, append(s.middleware, s.authMiddleware...))
+	s.mu.RUnlock()
+
+	r := &route{
+		handler:     finalHandler,
+		globalChain: globalChain,
+		authChain:   authChain,
+	}
+
+	s.routes.Store(key, r)
 }
 
-// RegisterHandlerFunc 注册基于命令和命令类型的处理函数
+// HandleAuth 注册需要认证的处理器
+func (s *Server) HandleAuth(command byte, commandType uint8, handler HandlerFunc, middlewares ...Middleware) {
+	// 为需要认证的处理器自动添加认证检查中间件
+	allMiddlewares := append([]Middleware{RequireAuthMiddleware()}, middlewares...)
+	s.Handle(command, commandType, handler, allMiddlewares...)
+}
+
+// RegisterHandlerFunc 注册处理器（兼容旧API）
 func (s *Server) RegisterHandlerFunc(command byte, commandType uint8, handler HandlerFunc) {
-	s.RegisterHandler(command, commandType, handler)
+	s.Handle(command, commandType, handler)
 }
 
-// RegisterCommandHandler 注册仅基于命令的处理器（向后兼容）
-func (s *Server) RegisterCommandHandler(command byte, handler Handler) {
+// Use 添加全局中间件（应用到所有请求）
+func (s *Server) Use(middlewares ...Middleware) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.commandHandlers[command] = handler
+	s.middleware = append(s.middleware, middlewares...)
+
+	// 重新编译所有路由的中间件链
+	s.recompileRoutes()
 }
 
-// RegisterCommandHandlerFunc 注册仅基于命令的处理函数（向后兼容）
-func (s *Server) RegisterCommandHandlerFunc(command byte, handler HandlerFunc) {
-	s.RegisterCommandHandler(command, handler)
+// UseAuth 添加认证中间件（仅应用到已认证的请求）
+func (s *Server) UseAuth(middlewares ...Middleware) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.authMiddleware = append(s.authMiddleware, middlewares...)
+
+	// 重新编译所有路由的中间件链
+	s.recompileRoutes()
 }
 
 // SetDefaultHandler 设置默认处理器
-func (s *Server) SetDefaultHandler(handler Handler) {
+func (s *Server) SetDefaultHandler(handler HandlerFunc) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.defaultHandler = handler
 }
 
-// Use 添加中间件
-func (s *Server) Use(middleware Middleware) {
-	s.middleware = append(s.middleware, middleware)
+// buildChain 构建中间件链
+func (s *Server) buildChain(handler HandlerFunc, middlewares []Middleware) HandlerFunc {
+	result := handler
+	for i := len(middlewares) - 1; i >= 0; i-- {
+		result = middlewares[i](result)
+	}
+	return result
+}
+
+// recompileRoutes 重新编译所有路由的中间件链
+func (s *Server) recompileRoutes() {
+	s.routes.Range(func(key, value interface{}) bool {
+		r := value.(*route)
+		r.globalChain = s.buildChain(r.handler, s.middleware)
+		r.authChain = s.buildChain(r.handler, append(s.middleware, s.authMiddleware...))
+		return true
+	})
 }
 
 // SetLogger 设置日志器
@@ -201,6 +236,51 @@ func SetAuthInfo(ctx context.Context, authInfo interface{}) {
 	}
 }
 
+// GetAuthInfo 从上下文中获取认证信息
+func GetAuthInfo(ctx context.Context) (interface{}, bool) {
+	authInfo := ctx.Value(AuthInfoKey)
+	if authInfo == nil {
+		return nil, false
+	}
+	return authInfo, true
+}
+
+// GetRemoteAddr 从上下文中获取远程地址
+func GetRemoteAddr(ctx context.Context) (string, bool) {
+	addr := ctx.Value(RemoteAddrKey)
+	if addr == nil {
+		return "", false
+	}
+	if strAddr, ok := addr.(string); ok {
+		return strAddr, true
+	}
+	return "", false
+}
+
+// ChainMiddleware 链式组合多个中间件
+func ChainMiddleware(middlewares ...Middleware) Middleware {
+	return func(next HandlerFunc) HandlerFunc {
+		// 从右到左应用中间件
+		result := next
+		for i := len(middlewares) - 1; i >= 0; i-- {
+			result = middlewares[i](result)
+		}
+		return result
+	}
+}
+
+// RequireAuthMiddleware 要求认证的中间件
+func RequireAuthMiddleware() Middleware {
+	return func(next HandlerFunc) HandlerFunc {
+		return func(ctx context.Context, command byte, commandType uint8, data []byte) ([]byte, error) {
+			if _, authenticated := GetAuthInfo(ctx); !authenticated {
+				return nil, ErrNotAuthenticated
+			}
+			return next(ctx, command, commandType, data)
+		}
+	}
+}
+
 // Start 启动服务器
 func (s *Server) Start() error {
 	listener, err := net.Listen("tcp", s.addr)
@@ -231,9 +311,7 @@ func (s *Server) Stop() error {
 
 // GetConnectionCount 获取当前连接数
 func (s *Server) GetConnectionCount() int32 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.connCount
+	return s.connCount.Load()
 }
 
 // acceptConnections 接受新连接
@@ -259,14 +337,11 @@ func (s *Server) acceptConnections() {
 		}
 
 		// 检查连接数限制
-		s.mu.RLock()
-		if s.connCount >= int32(s.maxConnections) {
-			s.mu.RUnlock()
+		if s.connCount.Load() >= int32(s.maxConnections) {
 			conn.Close()
 			s.logger.Printf("Connection rejected: max connections reached")
 			continue
 		}
-		s.mu.RUnlock()
 
 		// 处理连接
 		s.wg.Add(1)
@@ -280,15 +355,8 @@ func (s *Server) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
 	// 更新连接计数
-	s.mu.Lock()
-	s.connCount++
-	s.mu.Unlock()
-
-	defer func() {
-		s.mu.Lock()
-		s.connCount--
-		s.mu.Unlock()
-	}()
+	s.connCount.Add(1)
+	defer s.connCount.Add(-1)
 
 	s.logger.Printf("New connection from %s", conn.RemoteAddr())
 
@@ -380,29 +448,30 @@ func (s *Server) handleRequest(conn net.Conn, connCtx context.Context, head *che
 	command := head.GetCommand()
 	commandType := head.GetCommandType()
 
-	// 获取处理器，优先匹配精确路由（command + commandType）
-	s.mu.RLock()
+	// 获取路由
 	key := RouteKey{Command: command, CommandType: commandType}
-	handler, exists := s.handlers[key]
-	if !exists {
-		// 尝试仅基于命令的处理器
-		handler, exists = s.commandHandlers[command]
-		if !exists {
-			handler = s.defaultHandler
-		}
-	}
-	s.mu.RUnlock()
+	value, exists := s.routes.Load(key)
 
-	if handler == nil {
+	var finalHandler HandlerFunc
+	if exists {
+		r := value.(*route)
+		// 检查是否已认证，选择对应的中间件链
+		if _, authenticated := GetAuthInfo(connCtx); authenticated {
+			finalHandler = r.authChain
+		} else {
+			finalHandler = r.globalChain
+		}
+	} else {
+		// 使用默认处理器
+		s.mu.RLock()
+		finalHandler = s.defaultHandler
+		s.mu.RUnlock()
+	}
+
+	if finalHandler == nil {
 		s.logger.Printf("No handler for command %d, commandType %d", command, commandType)
 		s.sendErrorResponse(conn, head, fmt.Sprintf("No handler for command %d, commandType %d", command, commandType))
 		return connCtx
-	}
-
-	// 应用中间件链
-	finalHandler := handler
-	for i := len(s.middleware) - 1; i >= 0; i-- {
-		finalHandler = s.middleware[i](finalHandler)
 	}
 
 	// 创建请求上下文，继承连接上下文（包含认证信息）
@@ -417,7 +486,7 @@ func (s *Server) handleRequest(conn net.Conn, connCtx context.Context, head *che
 	}
 
 	// 调用处理器
-	response, err := finalHandler.Handle(ctx, command, commandType, data)
+	response, err := finalHandler(ctx, command, commandType, data)
 	if err != nil {
 		s.logger.Printf("Handler error for command %d, commandType %d: %v", command, commandType, err)
 		s.sendErrorResponse(conn, head, err.Error())

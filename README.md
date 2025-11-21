@@ -1,29 +1,22 @@
-# CServer - 基于 CHead 协议的可注入复用 TCP 服务器
+# cserver - 高性能 TCP 服务器框架
 
-CServer 是一个基于自定义协议头部 CHead 的高性能、可扩展的 TCP 服务器框架。它提供了中间件支持、请求路由、连接管理等功能，适用于构建各种 TCP 应用服务。
+## 概览
 
-## 特性
+cserver 是一个基于 Go 的高性能 TCP 服务器框架，支持中间件、路由、认证等功能。
 
-- 🚀 **高性能**: 基于 Go 的并发模型，支持大量并发连接
-- 🔌 **可注入**: 支持依赖注入，便于测试和模块化开发
-- 🔄 **可复用**: 模块化设计，组件可在不同项目间复用
-- 🛠️ **中间件支持**: 内置多种中间件，支持自定义中间件
-- 📊 **协议标准**: 基于 CHead 协议，提供结构化的消息传输
-- 🔒 **连接管理**: 支持连接数限制、超时控制
-- 📝 **详细日志**: 完整的请求响应日志记录
-- 🧪 **易测试**: 提供客户端工具，便于集成测试
+## 主要特性
+
+- 🚀 **高性能**: 使用中间件预编译和原子操作，避免运行时开销
+- 🔐 **内置认证**: 支持连接级认证和权限控制
+- 🎯 **灵活路由**: 支持命令路由、路由组、链式调用
+- 🔌 **中间件系统**: 全局/认证/路由级三级中间件支持
+- 📊 **内置中间件**: 日志、恢复、超时、限流、指标统计
+- ⚡ **标准化错误**: 完善的错误代码和错误处理机制
+- 🔄 **智能客户端**: 带重试、超时控制、自动重连
 
 ## 快速开始
 
-### 安装
-
-```bash
-go mod init your-project
-go mod edit -replace github.com/qorm/cserver=./path/to/cserver
-go mod edit -replace github.com/qorm/chead=./path/to/chead
-```
-
-### 创建服务器
+### 服务器端
 
 ```go
 package main
@@ -32,7 +25,6 @@ import (
     "context"
     "log"
     "os"
-    "strings"
     "time"
     
     "github.com/qorm/cserver"
@@ -40,228 +32,299 @@ import (
 
 func main() {
     // 创建服务器
-    server := cserver.NewServer(":8080")
-    
-    // 设置配置
-    server.SetTimeouts(30*time.Second, 30*time.Second)
-    server.SetMaxConnections(100)
-    
-    // 添加中间件
+    server := cserver.New(":8083")
     logger := log.New(os.Stdout, "[SERVER] ", log.LstdFlags)
-    server.Use(cserver.LoggingMiddleware(logger))
-    server.Use(cserver.RateLimitMiddleware(10)) // 每秒最多10个请求
-    
-    // 注册处理器
-    server.RegisterHandlerFunc(1, func(ctx context.Context, command byte, data []byte) ([]byte, error) {
-        return []byte(strings.ToUpper(string(data))), nil
+    server.SetLogger(logger)
+
+    // 添加全局中间件
+    server.Use(
+        cserver.LoggingMiddleware(logger),
+        cserver.RecoveryMiddleware(logger),
+    )
+
+    // 添加认证中间件
+    server.UseAuth(
+        cserver.TimeoutMiddleware(10 * time.Second),
+    )
+
+    // 注册认证处理器（命令 0,0）
+    server.Handle(0, 0, func(ctx context.Context, command byte, commandType uint8, data []byte) ([]byte, error) {
+        token := string(data)
+        if token == "valid_token" {
+            cserver.SetAuthInfo(ctx, map[string]string{"user": "admin"})
+            return []byte("authenticated"), nil
+        }
+        return nil, cserver.ErrAuthFailed
     })
-    
-    // 启动服务器
-    if err := server.Start(); err != nil {
-        log.Fatal(err)
-    }
+
+    // 注册业务处理器
+    server.HandleAuth(1, 0, func(ctx context.Context, command byte, commandType uint8, data []byte) ([]byte, error) {
+        authInfo, _ := cserver.GetAuthInfo(ctx)
+        return []byte("Hello, " + authInfo.(map[string]string)["user"]), nil
+    })
+
+    server.Start()
     defer server.Stop()
-    
-    // 等待...
-    select {}
 }
 ```
 
-### 创建客户端
+### 客户端
 
 ```go
 package main
 
 import (
     "context"
-    "fmt"
+    "log"
+    "time"
+    
     "github.com/qorm/cserver"
 )
 
 func main() {
-    client := cserver.NewClient()
-    defer client.Close()
-    
-    if err := client.Connect("localhost:8080"); err != nil {
-        panic(err)
-    }
-    
+    client := cserver.NewClient(
+        ":8083",
+        cserver.WithReadTimeout(10*time.Second),
+        cserver.WithMaxRetries(3),
+    )
+
     ctx := context.Background()
-    response, err := client.SendRequest(ctx, 1, 0, []byte("hello world"))
-    if err != nil {
-        panic(err)
+    if err := client.Connect(ctx); err != nil {
+        log.Fatal(err)
     }
-    
-    fmt.Printf("Response: %s\n", response) // Output: HELLO WORLD
+    defer client.Close()
+
+    // 认证
+    if err := client.Authenticate(ctx, []byte("valid_token")); err != nil {
+        log.Fatal(err)
+    }
+
+    // 发送请求
+    response, err := client.SendRequest(ctx, 1, 0, []byte("data"))
+    if err != nil {
+        log.Fatal(err)
+    }
+    log.Printf("Response: %s", response)
 }
 ```
 
-## 协议说明
+## 架构设计
 
-CServer 使用 CHead 协议进行通信，协议格式如下：
+### 中间件预编译
+
+路由注册时预编译中间件链，避免每次请求重新构建：
 
 ```
-| 1 byte | 1 byte | 4 bytes |  N bytes  |
-| High   | Low    | Length  | Data      |
+注册时:
+  handler -> 应用路由中间件 -> 预编译全局链 -> 预编译认证链
+
+运行时:
+  请求到达 -> 根据认证状态选择链 -> 直接执行（无构建开销）
 ```
 
-- **High**: 包含协议版本和命令信息
-- **Low**: 包含请求方向、响应类型和命令类型
-- **Length**: 数据长度（大端序）
-- **Data**: 实际数据
+### 三级中间件系统
 
-## 中间件
+1. **全局中间件**: 应用到所有请求
+2. **认证中间件**: 仅应用到已认证请求
+3. **路由中间件**: 仅应用到特定路由
 
-### 内置中间件
-
-1. **日志中间件** - 记录请求响应信息
 ```go
-server.Use(cserver.LoggingMiddleware(logger))
+// 全局 - 日志、恢复等
+server.Use(LoggingMiddleware, RecoveryMiddleware)
+
+// 认证后 - 限流、超时等
+server.UseAuth(RateLimitMiddleware, TimeoutMiddleware)
+
+// 路由级 - 特定逻辑
+server.Handle(cmd, cmdType, handler, CustomMiddleware)
 ```
 
-2. **限流中间件** - 控制请求频率
+## 高级用法
+
+### 路由组
+
 ```go
-server.Use(cserver.RateLimitMiddleware(10)) // 每秒最多10个请求
+// 创建共享中间件的路由组
+group := server.NewGroup()
+group.Use(cserver.RateLimitMiddleware(100))
+
+group.Handle(10, 0, handler1)
+group.HandleAuth(11, 0, handler2)
 ```
 
-3. **恢复中间件** - 捕获 panic，防止服务器崩溃
-```go
-server.Use(cserver.RecoveryMiddleware(logger))
-```
+### 路由构建器
 
-4. **超时中间件** - 控制处理超时
 ```go
-server.Use(cserver.TimeoutMiddleware(5 * time.Second))
-```
-
-5. **认证中间件** - 简单的token认证
-```go
-server.Use(cserver.AuthMiddleware(validateTokenFunc))
+// 链式调用
+server.NewRoute(20, 0).
+    Use(middleware1).
+    Use(middleware2).
+    Handler(myHandler)
 ```
 
 ### 自定义中间件
 
 ```go
-func CustomMiddleware() cserver.Middleware {
-    return func(next cserver.Handler) cserver.Handler {
-        return cserver.HandlerFunc(func(ctx context.Context, command byte, data []byte) ([]byte, error) {
+func MyMiddleware() cserver.Middleware {
+    return func(next cserver.HandlerFunc) cserver.HandlerFunc {
+        return func(ctx context.Context, command byte, commandType uint8, data []byte) ([]byte, error) {
             // 前置处理
-            response, err := next.Handle(ctx, command, data)
+            start := time.Now()
+            
+            // 调用下一个处理器
+            response, err := next(ctx, command, commandType, data)
+            
             // 后置处理
+            log.Printf("Duration: %v", time.Since(start))
+            
             return response, err
-        })
+        }
     }
 }
 ```
 
-## 处理器
-
-### 注册处理器
+### 认证流程
 
 ```go
-// 方式1：使用 HandlerFunc
-server.RegisterHandlerFunc(1, func(ctx context.Context, command byte, data []byte) ([]byte, error) {
-    return processCommand1(ctx, data)
+// 1. 启用认证
+server.EnableAuth()
+
+// 2. 注册认证处理器（命令 0,0）
+server.Handle(0, 0, func(ctx context.Context, command byte, commandType uint8, data []byte) ([]byte, error) {
+    token := string(data)
+    user := validateToken(token)
+    if user != nil {
+        // 设置认证信息
+        cserver.SetAuthInfo(ctx, user)
+        return []byte("ok"), nil
+    }
+    return nil, cserver.ErrAuthFailed
 })
 
-// 方式2：实现 Handler 接口
-type MyHandler struct{}
-
-func (h *MyHandler) Handle(ctx context.Context, command byte, data []byte) ([]byte, error) {
-    return processData(data), nil
-}
-
-server.RegisterHandler(2, &MyHandler{})
+// 3. 在处理器中获取认证信息
+server.HandleAuth(1, 0, func(ctx context.Context, command byte, commandType uint8, data []byte) ([]byte, error) {
+    user, _ := cserver.GetAuthInfo(ctx)
+    // 使用 user 信息...
+})
 ```
 
-### 默认处理器
+## 内置中间件
+
+### LoggingMiddleware
+记录请求和响应，包括命令、耗时、错误等。
+
+### RecoveryMiddleware
+捕获 panic 并转换为错误响应，防止服务崩溃。
+
+### TimeoutMiddleware
+为请求设置超时时间，超时自动返回错误。
+
+### RateLimitMiddleware
+基于令牌桶算法的限流中间件。
+
+### MetricsMiddleware
+收集请求统计信息（次数、错误、平均耗时等）。
+
+## 错误处理
+
+### 标准错误
 
 ```go
-server.SetDefaultHandler(cserver.HandlerFunc(func(ctx context.Context, command byte, data []byte) ([]byte, error) {
-    return nil, fmt.Errorf("unknown command: %d", command)
-}))
+// 使用预定义错误
+return nil, cserver.ErrNotAuthenticated
+return nil, cserver.ErrTimeout
+return nil, cserver.ErrRateLimit
+
+// 创建自定义错误
+return nil, cserver.NewError(
+    cserver.ErrCodeInvalidRequest,
+    "invalid parameters",
+    fmt.Errorf("missing field: name"),
+)
+```
+
+### 错误代码
+
+| 代码 | 常量 | 说明 |
+|-----|------|------|
+| 0 | ErrCodeUnknown | 未知错误 |
+| 1 | ErrCodeNotAuthenticated | 未认证 |
+| 2 | ErrCodeAuthFailed | 认证失败 |
+| 3 | ErrCodeNoHandler | 无处理器 |
+| 4 | ErrCodeTimeout | 超时 |
+| 5 | ErrCodeRateLimit | 限流 |
+| 6 | ErrCodeInvalidRequest | 无效请求 |
+| 7 | ErrCodeInternalError | 内部错误 |
+| 8 | ErrCodeConnectionClosed | 连接关闭 |
+| 9 | ErrCodeMaxConnections | 达到最大连接数 |
+| 10 | ErrCodeBadProtocol | 协议错误 |
+
+### 错误检查
+
+```go
+if cserver.IsServerError(err) {
+    code := cserver.GetErrorCode(err)
+    log.Printf("Error code: %d", code)
+}
 ```
 
 ## 配置选项
 
-### 超时设置
+### 服务器配置
+
 ```go
-server.SetTimeouts(
-    30*time.Second, // 读超时
-    30*time.Second, // 写超时
+server.SetTimeouts(30*time.Second, 30*time.Second)  // 读写超时
+server.SetMaxConnections(1000)                      // 最大连接数
+server.EnableAuth()                                  // 启用认证
+server.SetDefaultHandler(handler)                    // 默认处理器
+```
+
+### 客户端配置
+
+```go
+client := cserver.NewClient(
+    addr,
+    cserver.WithReadTimeout(30*time.Second),
+    cserver.WithWriteTimeout(30*time.Second),
+    cserver.WithConnectTimeout(10*time.Second),
+    cserver.WithMaxRetries(3),
+    cserver.WithRetryInterval(time.Second),
 )
 ```
 
-### 连接限制
-```go
-server.SetMaxConnections(1000) // 最大并发连接数
-```
-
-### 日志设置
-```go
-logger := log.New(os.Stdout, "[MYAPP] ", log.LstdFlags)
-server.SetLogger(logger)
-```
-
-## 客户端使用
-
-### 基本用法
-```go
-client := cserver.NewClient()
-client.SetTimeouts(10*time.Second, 10*time.Second)
-
-// 连接
-err := client.Connect("localhost:8080")
-
-// 发送需要响应的请求
-response, err := client.SendRequest(ctx, command, commandType, data)
-
-// 发送不需要响应的请求
-err = client.SendRequestNoResponse(ctx, command, commandType, data)
-```
-
-## 错误处理
-
-服务器会为以下情况发送错误响应：
-- 无效的协议头部
-- 未注册的命令（且无默认处理器）
-- 处理器返回错误
-- 请求超时
-
-错误响应使用特殊的命令号 255 和命令类型 31。
-
 ## 性能优化
 
-1. **连接池**: 客户端可以复用连接
-2. **批量处理**: 在处理器中实现批量逻辑
-3. **异步处理**: 对于不需要响应的请求，使用 `SendRequestNoResponse`
-4. **中间件顺序**: 将高频使用的中间件放在前面
+### 1. 中间件预编译
+路由注册时预编译中间件链，运行时直接执行，避免每次请求构建。
 
-## 监控指标
+### 2. 原子操作
+使用 `atomic.Int32` 进行连接计数，避免锁竞争。
 
-```go
-// 获取当前连接数
-connCount := server.GetConnectionCount()
-```
+### 3. sync.Map
+路由表使用 `sync.Map`，支持高并发读取。
 
-## 测试
+### 4. 连接复用
+客户端支持连接复用和自动重连，减少连接建立开销。
 
-运行测试：
-```bash
-go test -v ./...
-```
+### 5. 零拷贝
+尽可能减少数据拷贝，直接传递切片引用。
 
-测试覆盖以下场景：
-- 基本请求响应
-- 中间件链执行
-- 错误处理
-- 限流功能
-- 超时处理
+## 兼容性说明
 
-## 许可证
+**本版本不考虑向后兼容**，进行了以下重大改进：
 
-请参考项目根目录的 LICENSE 文件。
+1. 移除 `Handler` 接口，统一使用 `HandlerFunc`
+2. 中间件系统重构，支持预编译
+3. 错误类型标准化，使用 `ServerError`
+4. 客户端 API 简化，移除旧方法
+5. 路由 API 现代化，支持链式调用
 
-## 贡献
+## 示例
 
-欢迎提交 Issue 和 Pull Request！
+查看 `example/` 目录：
+- `example/auth_test/` - 认证示例
+- `example/middleware_usage/` - 中间件示例
+
+## License
+
+MIT License
